@@ -254,7 +254,7 @@ func TestSyncErrorCarriesExitCode(t *testing.T) {
 
 	_, err := NewClient(server.URL, "testpass").Sync(context.Background(), "user-a", "imap", "old")
 	var syncErr *SyncError
-	if !errors.As(err, &syncErr) || syncErr.ExitCode != ExitTempFail {
+	if !errors.As(err, &syncErr) || syncErr.ExitCode != 75 {
 		t.Fatalf("expected a SyncError with exit code 75, got %v", err)
 	}
 }

@@ -52,36 +52,52 @@ func syncSuccess(state string) string {
 }
 
 // A user whose state dsync rejects must recover with a full sync, not retry it forever.
-func TestStaleStateIsDroppedOnTempFail(t *testing.T) {
-	f := &fakeDoveadm{bodies: []string{syncFailure(75), syncSuccess("fresh")}}
-	h, q := newTestHandler(t, f)
-	ctx := context.Background()
-	if err := q.SetReplicationState(ctx, "u", "stale"); err != nil {
-		t.Fatal(err)
-	}
+// dsync reports stale state with either exit code.
+func TestStaleStateIsDroppedOnSyncFailure(t *testing.T) {
+	for _, code := range []int{75, 2} {
+		t.Run(fmt.Sprintf("exit %d", code), func(t *testing.T) {
+			f := &fakeDoveadm{bodies: []string{syncFailure(code), syncSuccess("fresh")}}
+			h, q := newTestHandler(t, f)
+			ctx := context.Background()
+			if err := q.SetReplicationState(ctx, "u", "stale"); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := h.Handle(ctx, "u"); err == nil {
-		t.Fatal("expected the failed sync to return an error, so that it is retried")
-	}
-	if err := h.Handle(ctx, "u"); err != nil {
-		t.Fatalf("retry failed: %v", err)
-	}
+			if err := h.Handle(ctx, "u"); err == nil {
+				t.Fatal("expected the failed sync to return an error, so that it is retried")
+			}
+			if err := h.Handle(ctx, "u"); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
 
-	if !strings.Contains(f.sent[0], `"state":"stale"`) {
-		t.Errorf("first sync should send the stored state: %s", f.sent[0])
-	}
-	if !strings.Contains(f.sent[1], `"state":""`) {
-		t.Errorf("retry should be a full sync: %s", f.sent[1])
-	}
-	if got, _ := q.GetReplicationState(ctx, "u"); got != "fresh" {
-		t.Errorf("state = %q, want fresh", got)
+			if !strings.Contains(f.sent[0], `"state":"stale"`) {
+				t.Errorf("first sync should send the stored state: %s", f.sent[0])
+			}
+			if !strings.Contains(f.sent[1], `"state":""`) {
+				t.Errorf("retry should be a full sync: %s", f.sent[1])
+			}
+			if got, _ := q.GetReplicationState(ctx, "u"); got != "fresh" {
+				t.Errorf("state = %q, want fresh", got)
+			}
+		})
 	}
 }
 
-// Other failures say nothing about the state, so it survives and incremental sync resumes.
-func TestStateSurvivesOtherFailures(t *testing.T) {
-	f := &fakeDoveadm{bodies: []string{syncFailure(2)}}
-	h, q := newTestHandler(t, f)
+// An HTTP failure says nothing about the state, so incremental sync resumes afterwards.
+func TestStateSurvivesHTTPFailure(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		_ = q.Close()
+	})
+	h := NewDoveadmEventHandler(server.URL, "pw", "tcp:b:12345", logger, q)
 	ctx := context.Background()
 	if err := q.SetReplicationState(ctx, "u", "kept"); err != nil {
 		t.Fatal(err)

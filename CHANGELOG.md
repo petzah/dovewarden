@@ -1,3 +1,7 @@
+# dovewarden 0.1.1-homelab.2
+
+- fix: drop replication state on any failure Doveadm reports: dsync also rejects stale state with exit code 2, which still left a user stuck
+
 # dovewarden 0.1.1-homelab.1
 
 Fork of 0.1.1.

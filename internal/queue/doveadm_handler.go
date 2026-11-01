@@ -46,9 +46,11 @@ func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error
 	if err != nil {
 		h.logger.Error("dsync failed", "username", username, "error", err)
 		// dsync keeps refusing state it can no longer use, so retrying with it would
-		// never succeed. Without it the retry is a full sync, which returns new state.
+		// never succeed. It reports that as exit 75 or 2, so drop the state on any failure
+		// Doveadm reports: a wrong guess costs one full sync, a missed code a stuck user.
+		// Network and HTTP errors say nothing about the state, so those keep it.
 		var syncErr *doveadm.SyncError
-		if state != "" && errors.As(err, &syncErr) && syncErr.ExitCode == doveadm.ExitTempFail {
+		if state != "" && errors.As(err, &syncErr) {
 			if clearErr := h.queue.SetReplicationState(ctx, username, ""); clearErr != nil {
 				h.logger.Error("Failed to clear replication state", "username", username, "error", clearErr)
 			}

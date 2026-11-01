@@ -32,10 +32,6 @@ type ResponseError struct {
 	ExitCode int    `json:"exitCode"`
 }
 
-// ExitTempFail is the exit code (EX_TEMPFAIL) dsync returns when a sync should be
-// retried, including when incremental state refers to a log Dovecot no longer has.
-const ExitTempFail = 75
-
 // SyncError is a sync that Doveadm itself reported as failed.
 type SyncError struct {
 	Tag      string
