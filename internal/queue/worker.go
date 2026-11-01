@@ -59,6 +59,10 @@ type WorkerPool struct {
 	retryMaxDelay  time.Duration
 	retryMu        sync.Mutex
 	retries        map[string]*retryState
+
+	// Users being synced; the value records that an event arrived meanwhile.
+	inFlightMu sync.Mutex
+	inFlight   map[string]bool
 }
 
 // NewWorkerPool creates a new worker pool with the specified number of workers.
@@ -74,6 +78,8 @@ func NewWorkerPool(q Queue, numWorkers int, logger *slog.Logger) *WorkerPool {
 		retryBaseDelay: defaultRetryBaseDelay,
 		retryMaxDelay:  defaultRetryMaxDelay,
 		retries:        make(map[string]*retryState),
+
+		inFlight: make(map[string]bool),
 	}
 }
 
@@ -179,6 +185,11 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 			continue
 		}
 
+		if !wp.claim(username) {
+			wp.logger.Debug("User already syncing, will rerun", "worker_id", id, "username", username)
+			continue
+		}
+
 		// mark active
 		atomic.AddInt32(&wp.activeCount, 1)
 		wp.logger.Debug("Processing event", "worker_id", id, "username", username)
@@ -190,9 +201,38 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 		} else {
 			wp.clearRetry(username)
 		}
+		wp.release(ctx, username)
 
 		// mark inactive
 		atomic.AddInt32(&wp.activeCount, -1)
+	}
+}
+
+// claim reserves the user for this worker. Two syncs of one user must not overlap: the
+// state of one can claim mail the other has not copied, and every later incremental
+// sync then skips that mail while still reporting success.
+func (wp *WorkerPool) claim(username string) bool {
+	wp.inFlightMu.Lock()
+	defer wp.inFlightMu.Unlock()
+	if _, busy := wp.inFlight[username]; busy {
+		wp.inFlight[username] = true
+		return false
+	}
+	wp.inFlight[username] = false
+	return true
+}
+
+// release frees the user and requeues it if an event arrived during the sync, which
+// that sync may have missed.
+func (wp *WorkerPool) release(ctx context.Context, username string) {
+	wp.inFlightMu.Lock()
+	rerun := wp.inFlight[username]
+	delete(wp.inFlight, username)
+	wp.inFlightMu.Unlock()
+	if rerun {
+		if err := wp.queue.Enqueue(ctx, username, 1.0); err != nil {
+			wp.logger.Error("Failed to requeue", "username", username, "error", err)
+		}
 	}
 }
 

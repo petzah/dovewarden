@@ -74,10 +74,13 @@ func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error
 		}
 	}
 
-	// Record the timestamp of this successful replication
-	if err := h.queue.SetLastReplicationTime(ctx, username, time.Now()); err != nil {
-		h.logger.Warn("Failed to store last replication time", "username", username, "error", err)
-		// Don't fail the sync operation if timestamp storage fails
+	// Record when this user last had a full sync. Incremental syncs do not count: they
+	// trust the state, so only a full one repairs what the state got wrong.
+	if state == "" {
+		if err := h.queue.SetLastReplicationTime(ctx, username, time.Now()); err != nil {
+			h.logger.Warn("Failed to store last replication time", "username", username, "error", err)
+			// Don't fail the sync operation if timestamp storage fails
+		}
 	}
 
 	h.logger.Info("dsync completed", "username", username)

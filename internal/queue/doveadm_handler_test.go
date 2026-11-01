@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/dovewarden/dovewarden/internal/doveadm"
 )
 
 // fakeDoveadm answers sync requests with queued bodies and records the state it was sent.
@@ -125,5 +128,62 @@ func TestOversizedStateIsNotStored(t *testing.T) {
 	}
 	if got, _ := q.GetReplicationState(ctx, "u"); got != "" {
 		t.Errorf("state has %d bytes, want none", len(got))
+	}
+}
+
+// Only a full sync counts towards the background pass, or a busy user would never get one.
+func TestOnlyFullSyncResetsLastReplication(t *testing.T) {
+	f := &fakeDoveadm{bodies: []string{syncSuccess("one"), syncSuccess("two")}}
+	h, q := newTestHandler(t, f)
+	ctx := context.Background()
+
+	if err := h.Handle(ctx, "u"); err != nil { // no state yet: full
+		t.Fatalf("sync failed: %v", err)
+	}
+	first, _ := q.GetLastReplicationTime(ctx, "u")
+	if first.IsZero() {
+		t.Fatal("a full sync should record the time")
+	}
+	if err := h.Handle(ctx, "u"); err != nil { // has state: incremental
+		t.Fatalf("sync failed: %v", err)
+	}
+	if second, _ := q.GetLastReplicationTime(ctx, "u"); !second.Equal(first) {
+		t.Errorf("an incremental sync moved the time from %v to %v", first, second)
+	}
+}
+
+// The background pass must drop state, or it inherits whatever the state got wrong.
+func TestBackgroundPassForcesFullSync(t *testing.T) {
+	f := &fakeDoveadm{bodies: []string{`[["doveadmResponse",{"userList":["due","recent"]},"tag"]]`}}
+	server := httptest.NewServer(f)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	t.Cleanup(func() {
+		server.Close()
+		_ = q.Close()
+	})
+	ctx := context.Background()
+	for _, u := range []string{"due", "recent"} {
+		if err := q.SetReplicationState(ctx, u, "old"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.SetLastReplicationTime(ctx, "recent", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewBackgroundReplicationService(doveadm.NewClient(server.URL, "pw"), q, logger, time.Hour, time.Hour)
+	if err := s.runReplication(ctx); err != nil {
+		t.Fatalf("background pass failed: %v", err)
+	}
+
+	if got, _ := q.GetReplicationState(ctx, "due"); got != "" {
+		t.Errorf("due user kept state %q", got)
+	}
+	if got, _ := q.GetReplicationState(ctx, "recent"); got != "old" {
+		t.Errorf("recently synced user lost its state: %q", got)
 	}
 }

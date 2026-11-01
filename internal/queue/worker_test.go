@@ -249,3 +249,57 @@ func TestRetryResetsAfterSuccess(t *testing.T) {
 		t.Fatalf("expected no failures on record after recovery, got %d", len(wp.retries))
 	}
 }
+
+// TestOneSyncPerUser verifies syncs of one user never overlap, and that an event arriving
+// during a sync causes another one, since the running sync may have missed it.
+func TestOneSyncPerUser(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var running, overlaps, finished int32
+	started := make(chan struct{}, 100)
+	wp := NewWorkerPool(q, 4, logger)
+	wp.SetHandler(&TestHandler{onHandle: func(string) error {
+		if atomic.AddInt32(&running, 1) > 1 {
+			atomic.AddInt32(&overlaps, 1)
+		}
+		started <- struct{}{}
+		time.Sleep(400 * time.Millisecond)
+		atomic.AddInt32(&running, -1)
+		atomic.AddInt32(&finished, 1)
+		return nil
+	}})
+	wp.Start(ctx)
+
+	if err := q.Enqueue(ctx, "user-a", 1.0); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	<-started
+	// Arrives mid-sync, so one more sync must follow the running one.
+	for i := 0; i < 3; i++ {
+		if err := q.Enqueue(ctx, "user-a", 1.0); err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := wp.Stop(stopCtx); err != nil {
+		t.Fatalf("failed to stop worker pool: %v", err)
+	}
+	if got := atomic.LoadInt32(&overlaps); got != 0 {
+		t.Errorf("%d syncs overlapped", got)
+	}
+	if got := atomic.LoadInt32(&finished); got < 2 {
+		t.Errorf("expected a second sync for the mid-sync event, got %d sync(s)", got)
+	}
+}

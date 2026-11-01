@@ -1,3 +1,8 @@
+# dovewarden 0.1.1-homelab.3
+
+- fix: run one sync per user at a time. Overlapping syncs could store state claiming mail was copied when it was not, so later syncs reported success and left the sides different (upstream #10)
+- fix: the background pass is now a real full sync, and its threshold counts only full syncs, so a busy user cannot avoid it
+
 # dovewarden 0.1.1-homelab.2
 
 - fix: drop replication state on any failure Doveadm reports: dsync also rejects stale state with exit code 2, which still left a user stuck
