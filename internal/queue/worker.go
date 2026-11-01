@@ -26,6 +26,19 @@ func (h *DefaultEventHandler) Handle(ctx context.Context, username string) error
 	return nil
 }
 
+// Delays between retries of a user whose sync keeps failing. The maximum bounds how
+// long a user waits after the other side comes back.
+const (
+	defaultRetryBaseDelay = time.Second
+	defaultRetryMaxDelay  = 30 * time.Second
+)
+
+// retryState tracks a user whose last sync failed.
+type retryState struct {
+	failures int
+	timer    *time.Timer // non-nil while a retry is pending
+}
+
 // WorkerPool manages a pool of workers that dequeue and process events.
 type WorkerPool struct {
 	queue      Queue
@@ -41,6 +54,11 @@ type WorkerPool struct {
 	jobsCh chan string
 
 	activeCount int32
+
+	retryBaseDelay time.Duration
+	retryMaxDelay  time.Duration
+	retryMu        sync.Mutex
+	retries        map[string]*retryState
 }
 
 // NewWorkerPool creates a new worker pool with the specified number of workers.
@@ -52,7 +70,19 @@ func NewWorkerPool(q Queue, numWorkers int, logger *slog.Logger) *WorkerPool {
 		logger:     logger,
 		stopCh:     make(chan struct{}),
 		jobsCh:     make(chan string, 1),
+
+		retryBaseDelay: defaultRetryBaseDelay,
+		retryMaxDelay:  defaultRetryMaxDelay,
+		retries:        make(map[string]*retryState),
 	}
+}
+
+// SetRetryDelays overrides the delays between retries of a failing user.
+func (wp *WorkerPool) SetRetryDelays(base, max time.Duration) {
+	wp.retryMu.Lock()
+	defer wp.retryMu.Unlock()
+	wp.retryBaseDelay = base
+	wp.retryMaxDelay = max
 }
 
 // SetHandler sets a custom event handler for the worker pool.
@@ -143,21 +173,77 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 			return
 		}
 
+		// A pending retry covers whatever this event was about.
+		if wp.retryPending(username) {
+			wp.logger.Debug("Skipping user in backoff", "worker_id", id, "username", username)
+			continue
+		}
+
 		// mark active
 		atomic.AddInt32(&wp.activeCount, 1)
 		wp.logger.Debug("Processing event", "worker_id", id, "username", username)
 
 		// Handle the event
 		if err := wp.handler.Handle(ctx, username); err != nil {
-			wp.logger.Error("Handler failed, requeuing", "worker_id", id, "username", username, "error", err)
-			if err := wp.queue.Enqueue(ctx, username, 1.0); err != nil {
-				wp.logger.Error("Failed to requeue", "worker_id", id, "username", username, "error", err)
-			}
+			delay := wp.scheduleRetry(ctx, username)
+			wp.logger.Error("Handler failed, requeuing", "worker_id", id, "username", username, "delay", delay, "error", err)
+		} else {
+			wp.clearRetry(username)
 		}
 
 		// mark inactive
 		atomic.AddInt32(&wp.activeCount, -1)
 	}
+}
+
+// retryPending reports whether a retry is already scheduled for the user.
+func (wp *WorkerPool) retryPending(username string) bool {
+	wp.retryMu.Lock()
+	defer wp.retryMu.Unlock()
+	r, ok := wp.retries[username]
+	return ok && r.timer != nil
+}
+
+// scheduleRetry requeues the user after a delay that doubles with each failure in a row.
+func (wp *WorkerPool) scheduleRetry(ctx context.Context, username string) time.Duration {
+	wp.retryMu.Lock()
+	defer wp.retryMu.Unlock()
+
+	r, ok := wp.retries[username]
+	if !ok {
+		r = &retryState{}
+		wp.retries[username] = r
+	}
+	r.failures++
+
+	delay := wp.retryBaseDelay
+	for i := 1; i < r.failures && delay < wp.retryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > wp.retryMaxDelay {
+		delay = wp.retryMaxDelay
+	}
+
+	// Two workers can fail on one user at once; one retry is enough.
+	if r.timer != nil {
+		return delay
+	}
+	r.timer = time.AfterFunc(delay, func() {
+		wp.retryMu.Lock()
+		r.timer = nil
+		wp.retryMu.Unlock()
+		if err := wp.queue.Enqueue(ctx, username, 1.0); err != nil {
+			wp.logger.Error("Failed to requeue", "username", username, "error", err)
+		}
+	})
+	return delay
+}
+
+// clearRetry forgets a user's failures after a successful sync.
+func (wp *WorkerPool) clearRetry(username string) {
+	wp.retryMu.Lock()
+	defer wp.retryMu.Unlock()
+	delete(wp.retries, username)
 }
 
 // takeJob reads a single job from jobsCh, blocking until available or channel closed.
@@ -170,6 +256,13 @@ func (wp *WorkerPool) takeJob() (string, bool) {
 // It stops accepting new tasks and waits for all active tasks to complete.
 func (wp *WorkerPool) Stop(ctx context.Context) error {
 	wp.logger.Info("Stopping worker pool")
+	wp.retryMu.Lock()
+	for _, r := range wp.retries {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+	}
+	wp.retryMu.Unlock()
 	// signal to stop
 	select {
 	case <-wp.stopCh:

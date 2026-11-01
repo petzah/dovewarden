@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"sync/atomic"
@@ -180,4 +181,71 @@ func (h *TestHandler) Handle(ctx context.Context, username string) error {
 		return h.onHandle(username)
 	}
 	return nil
+}
+
+// runFailing counts the handler calls for one user within the given window, and returns
+// the stopped pool.
+func runFailing(t *testing.T, window time.Duration, onHandle func(attempt int32) error) (int32, *WorkerPool) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Enqueue(ctx, "user-a", 1.0); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	var attempts int32
+	wp := NewWorkerPool(q, 4, logger)
+	wp.SetRetryDelays(100*time.Millisecond, 400*time.Millisecond)
+	wp.SetHandler(&TestHandler{onHandle: func(string) error {
+		return onHandle(atomic.AddInt32(&attempts, 1))
+	}})
+	wp.Start(ctx)
+
+	// New events during a backoff must not bring the next attempt forward.
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if err := q.Enqueue(ctx, "user-a", 1.0); err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := wp.Stop(stopCtx); err != nil {
+		t.Fatalf("failed to stop worker pool: %v", err)
+	}
+	return atomic.LoadInt32(&attempts), wp
+}
+
+// TestRetryBacksOff verifies a failing user is not hammered, even while events keep coming.
+func TestRetryBacksOff(t *testing.T) {
+	attempts, _ := runFailing(t, 2*time.Second, func(int32) error { return errors.New("down") })
+	// Delays 100, 200, 400, 400... allow about 6 attempts in 2 s, a fetch loop hundreds.
+	if attempts < 3 || attempts > 9 {
+		t.Fatalf("expected a backed-off number of attempts, got %d", attempts)
+	}
+}
+
+// TestRetryResetsAfterSuccess verifies a recovered user leaves backoff.
+func TestRetryResetsAfterSuccess(t *testing.T) {
+	attempts, wp := runFailing(t, 2*time.Second, func(attempt int32) error {
+		if attempt == 1 {
+			return errors.New("down once")
+		}
+		return nil
+	})
+	if attempts < 2 {
+		t.Fatalf("expected a retry, got %d attempts", attempts)
+	}
+	if len(wp.retries) != 0 {
+		t.Fatalf("expected no failures on record after recovery, got %d", len(wp.retries))
+	}
 }

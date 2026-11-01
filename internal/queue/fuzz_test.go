@@ -61,6 +61,8 @@ func FuzzQueueDequeue(f *testing.F) {
 		var usersProcessed sync.Map
 		numWorkers := 10
 		wp := NewWorkerPool(q, numWorkers, logger)
+		// The handler fails at random, and the drain below is shorter than the default delay.
+		wp.SetRetryDelays(time.Millisecond, 10*time.Millisecond)
 		wp.SetHandler(&FuzzingHandler{usersProcessed: &usersProcessed})
 		wp.Start(ctx)
 
@@ -91,8 +93,21 @@ func FuzzQueueDequeue(f *testing.F) {
 			}
 		}
 
-		// Allow workers some time to drain the queue
-		time.Sleep(500 * time.Millisecond)
+		// Allow workers time to drain the queue. A user can fail several times in a row,
+		// and each retry can wait out the fetcher's pause on an empty queue.
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			pending := 0
+			for u := range usersAdded {
+				if _, ok := usersProcessed.Load(u); !ok {
+					pending++
+				}
+			}
+			if pending == 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 
 		// Stop the worker pool gracefully
 		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

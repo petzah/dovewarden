@@ -32,6 +32,21 @@ type ResponseError struct {
 	ExitCode int    `json:"exitCode"`
 }
 
+// ExitTempFail is the exit code (EX_TEMPFAIL) dsync returns when a sync should be
+// retried, including when incremental state refers to a log Dovecot no longer has.
+const ExitTempFail = 75
+
+// SyncError is a sync that Doveadm itself reported as failed.
+type SyncError struct {
+	Tag      string
+	Type     string
+	ExitCode int
+}
+
+func (e *SyncError) Error() string {
+	return fmt.Sprintf("doveadm sync error (tag %s): %s (exitCode %d)", e.Tag, e.Type, e.ExitCode)
+}
+
 // SyncResponse represents the response from a sync operation
 type SyncResponse struct {
 	State string // Replication state for incremental sync
@@ -151,7 +166,7 @@ func (c *Client) Sync(ctx context.Context, username string, destination string, 
 	for _, entry := range respPayload {
 		if entry.Status == "error" {
 			if entry.Error != nil {
-				return nil, fmt.Errorf("doveadm sync error (tag %s): %s (exitCode %d)", entry.Tag, entry.Error.Type, entry.Error.ExitCode)
+				return nil, &SyncError{Tag: entry.Tag, Type: entry.Error.Type, ExitCode: entry.Error.ExitCode}
 			}
 			return nil, fmt.Errorf("doveadm sync error (tag %s): unknown reason", entry.Tag)
 		}

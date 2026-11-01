@@ -3,6 +3,7 @@ package doveadm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -241,5 +242,19 @@ func TestSyncWithoutState(t *testing.T) {
 	}
 	if resp.State != "" {
 		t.Errorf("expected empty state, got %s", resp.State)
+	}
+}
+
+// TestSyncErrorCarriesExitCode verifies callers can tell why Doveadm refused a sync.
+func TestSyncErrorCarriesExitCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[["error",{"type":"exitCode","exitCode":75},"dovewarden-sync"]]`)
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, "testpass").Sync(context.Background(), "user-a", "imap", "old")
+	var syncErr *SyncError
+	if !errors.As(err, &syncErr) || syncErr.ExitCode != ExitTempFail {
+		t.Fatalf("expected a SyncError with exit code 75, got %v", err)
 	}
 }

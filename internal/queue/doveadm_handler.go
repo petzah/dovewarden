@@ -2,11 +2,16 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
 	"github.com/dovewarden/dovewarden/internal/doveadm"
 )
+
+// maxStateSize keeps replication state under the 32 KiB Doveadm accepts in a JSON
+// string. Larger state would make every later sync fail with HTTP 400.
+const maxStateSize = 32000
 
 // DoveadmEventHandler handles events by sending dsync requests to Doveadm
 type DoveadmEventHandler struct {
@@ -40,12 +45,26 @@ func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error
 	resp, err := h.client.Sync(ctx, username, h.destination, state)
 	if err != nil {
 		h.logger.Error("dsync failed", "username", username, "error", err)
+		// dsync keeps refusing state it can no longer use, so retrying with it would
+		// never succeed. Without it the retry is a full sync, which returns new state.
+		var syncErr *doveadm.SyncError
+		if state != "" && errors.As(err, &syncErr) && syncErr.ExitCode == doveadm.ExitTempFail {
+			if clearErr := h.queue.SetReplicationState(ctx, username, ""); clearErr != nil {
+				h.logger.Error("Failed to clear replication state", "username", username, "error", clearErr)
+			}
+		}
 		return err
 	}
 
 	// Store the new replication state for next sync
 	if resp.State != "" {
-		if err := h.queue.SetReplicationState(ctx, username, resp.State); err != nil {
+		newState := resp.State
+		if len(newState) > maxStateSize {
+			h.logger.Warn("Replication state too large for Doveadm, next sync will be full",
+				"username", username, "size", len(newState))
+			newState = ""
+		}
+		if err := h.queue.SetReplicationState(ctx, username, newState); err != nil {
 			h.logger.Warn("Failed to store replication state", "username", username, "error", err)
 			// Don't fail the sync operation if state storage fails
 		} else {
