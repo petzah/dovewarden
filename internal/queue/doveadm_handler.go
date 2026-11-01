@@ -2,16 +2,11 @@ package queue
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
 	"github.com/dovewarden/dovewarden/internal/doveadm"
 )
-
-// maxStateSize keeps replication state under the 32 KiB Doveadm accepts in a JSON
-// string. Larger state would make every later sync fail with HTTP 400.
-const maxStateSize = 32000
 
 // DoveadmEventHandler handles events by sending dsync requests to Doveadm
 type DoveadmEventHandler struct {
@@ -31,56 +26,24 @@ func NewDoveadmEventHandler(baseURL, password, destination string, logger *slog.
 	}
 }
 
-// Handle sends a dsync request to Doveadm for the given username
+// Handle sends a dsync request to Doveadm for the given username.
+//
+// Every sync is a full one, on purpose. Incremental state can go wrong with no signal:
+// dsync then finds nothing to do and exits 0 while the two sides stay different, and a
+// delete it never saw can bring mail back. A full sync costs about 150 ms on a mailbox of
+// a thousand messages, so the state is not worth that risk here.
 func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error {
-	// Retrieve the last known replication state for this user
-	state, err := h.queue.GetReplicationState(ctx, username)
-	if err != nil {
-		h.logger.Warn("Failed to get replication state, proceeding without state", "username", username, "error", err)
-		state = ""
-	}
+	h.logger.Info("Syncing user via dsync", "username", username, "destination", h.destination)
 
-	h.logger.Info("Syncing user via dsync", "username", username, "destination", h.destination, "has_state", state != "")
-
-	resp, err := h.client.Sync(ctx, username, h.destination, state)
-	if err != nil {
+	if _, err := h.client.Sync(ctx, username, h.destination, ""); err != nil {
 		h.logger.Error("dsync failed", "username", username, "error", err)
-		// dsync keeps refusing state it can no longer use, so retrying with it would
-		// never succeed. It reports that as exit 75 or 2, so drop the state on any failure
-		// Doveadm reports: a wrong guess costs one full sync, a missed code a stuck user.
-		// Network and HTTP errors say nothing about the state, so those keep it.
-		var syncErr *doveadm.SyncError
-		if state != "" && errors.As(err, &syncErr) {
-			if clearErr := h.queue.SetReplicationState(ctx, username, ""); clearErr != nil {
-				h.logger.Error("Failed to clear replication state", "username", username, "error", clearErr)
-			}
-		}
 		return err
 	}
 
-	// Store the new replication state for next sync
-	if resp.State != "" {
-		newState := resp.State
-		if len(newState) > maxStateSize {
-			h.logger.Warn("Replication state too large for Doveadm, next sync will be full",
-				"username", username, "size", len(newState))
-			newState = ""
-		}
-		if err := h.queue.SetReplicationState(ctx, username, newState); err != nil {
-			h.logger.Warn("Failed to store replication state", "username", username, "error", err)
-			// Don't fail the sync operation if state storage fails
-		} else {
-			h.logger.Debug("Stored replication state", "username", username)
-		}
-	}
-
-	// Record when this user last had a full sync. Incremental syncs do not count: they
-	// trust the state, so only a full one repairs what the state got wrong.
-	if state == "" {
-		if err := h.queue.SetLastReplicationTime(ctx, username, time.Now()); err != nil {
-			h.logger.Warn("Failed to store last replication time", "username", username, "error", err)
-			// Don't fail the sync operation if timestamp storage fails
-		}
+	// Record the timestamp of this successful replication
+	if err := h.queue.SetLastReplicationTime(ctx, username, time.Now()); err != nil {
+		h.logger.Warn("Failed to store last replication time", "username", username, "error", err)
+		// Don't fail the sync operation if timestamp storage fails
 	}
 
 	h.logger.Info("dsync completed", "username", username)

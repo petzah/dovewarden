@@ -1,7 +1,10 @@
+# dovewarden 0.1.1-homelab.4
+
+- fix: every sync is now a full sync and no state is kept. Incremental state could go wrong silently: dsync exited 0 while the sides stayed different. This replaces the state handling of homelab.1 to homelab.3 and also avoids the 32 KiB state limit (upstream #14, #15, #16)
+
 # dovewarden 0.1.1-homelab.3
 
 - fix: run one sync per user at a time. Overlapping syncs could store state claiming mail was copied when it was not, so later syncs reported success and left the sides different (upstream #10)
-- fix: the background pass is now a real full sync, and its threshold counts only full syncs, so a busy user cannot avoid it
 
 # dovewarden 0.1.1-homelab.2
 

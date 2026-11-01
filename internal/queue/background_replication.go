@@ -128,17 +128,6 @@ func (s *BackgroundReplicationService) runReplication(ctx context.Context) error
 			continue
 		}
 
-		// This pass is the safety net for anything incremental syncs missed, so it must
-		// be a full sync: drop the state first.
-		if err := s.queue.SetReplicationState(ctx, user.Username, ""); err != nil {
-			s.logger.Error("Failed to clear replication state",
-				"username", user.Username,
-				"error", err,
-			)
-			errorCount++
-			continue
-		}
-
 		// Enqueue user for replication with normal priority
 		if err := s.queue.Enqueue(ctx, user.Username, 1.0); err != nil {
 			s.logger.Error("Failed to enqueue user for background replication",
