@@ -6,9 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dovewarden/dovewarden/internal/doveadm"
 )
 
 // TestWorkerPoolDequeue verifies that workers dequeue events from the queue.
@@ -301,5 +304,84 @@ func TestOneSyncPerUser(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&finished); got < 2 {
 		t.Errorf("expected a second sync for the mid-sync event, got %d sync(s)", got)
+	}
+}
+
+// outageHandler fails every sync as unreachable while down is set, and probes the same way.
+type outageHandler struct {
+	down     atomic.Bool
+	attempts atomic.Int32
+	mu       sync.Mutex
+	synced   map[string]bool
+}
+
+func (h *outageHandler) Handle(_ context.Context, username string) error {
+	h.attempts.Add(1)
+	if h.down.Load() {
+		return &doveadm.UnreachableError{Err: errors.New("connection refused")}
+	}
+	h.mu.Lock()
+	h.synced[username] = true
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *outageHandler) Probe(context.Context) error {
+	if h.down.Load() {
+		return &doveadm.UnreachableError{Err: errors.New("connection refused")}
+	}
+	return nil
+}
+
+// TestOutagePausesAndResumes verifies that while Doveadm is unreachable the pool stops
+// trying users instead of retrying each one, and that every waiting user syncs as soon as
+// it answers again rather than at the end of its own backoff.
+func TestOutagePausesAndResumes(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := &outageHandler{synced: make(map[string]bool)}
+	h.down.Store(true)
+	wp := NewWorkerPool(q, 4, logger)
+	wp.SetHandler(h)
+	wp.SetProbeInterval(100 * time.Millisecond)
+	wp.Start(ctx)
+
+	users := []string{"u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10"}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, u := range users {
+			if err := q.Enqueue(ctx, u, 1.0); err != nil {
+				t.Fatalf("enqueue failed: %v", err)
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Only the jobs already taken when the pool paused may fail: the workers and the
+	// one buffered in the pipe.
+	if got := h.attempts.Load(); got > 6 {
+		t.Errorf("expected the pool to pause, got %d attempts while down", got)
+	}
+
+	h.down.Store(false)
+	time.Sleep(700 * time.Millisecond)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := wp.Stop(stopCtx); err != nil {
+		t.Fatalf("failed to stop worker pool: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, u := range users {
+		if !h.synced[u] {
+			t.Errorf("%s was not synced after Doveadm came back", u)
+		}
 	}
 }

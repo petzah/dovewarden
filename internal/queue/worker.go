@@ -6,6 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dovewarden/dovewarden/internal/doveadm"
+	"github.com/dovewarden/dovewarden/internal/metrics"
 )
 
 // EventHandler is the interface for handling dequeued events.
@@ -26,11 +29,19 @@ func (h *DefaultEventHandler) Handle(ctx context.Context, username string) error
 	return nil
 }
 
+// Prober is implemented by a handler that can tell whether its backend answers at all.
+// With one, the pool pauses while the backend is unreachable instead of retrying every
+// user against it.
+type Prober interface {
+	Probe(ctx context.Context) error
+}
+
 // Delays between retries of a user whose sync keeps failing. The maximum bounds how
 // long a user waits after the other side comes back.
 const (
 	defaultRetryBaseDelay = time.Second
 	defaultRetryMaxDelay  = 30 * time.Second
+	defaultProbeInterval  = 2 * time.Second
 )
 
 // retryState tracks a user whose last sync failed.
@@ -63,6 +74,15 @@ type WorkerPool struct {
 	// Users being synced; the value records that an event arrived meanwhile.
 	inFlightMu sync.Mutex
 	inFlight   map[string]bool
+
+	// While Doveadm is unreachable the fetcher waits on resumeCh, and users whose sync
+	// failed for that reason wait in parked until a probe succeeds.
+	probeInterval time.Duration
+	pauseMu       sync.Mutex
+	resumeCh      chan struct{} // non-nil while paused
+	parked        map[string]struct{}
+
+	metrics *metrics.Metrics // optional
 }
 
 // NewWorkerPool creates a new worker pool with the specified number of workers.
@@ -80,7 +100,28 @@ func NewWorkerPool(q Queue, numWorkers int, logger *slog.Logger) *WorkerPool {
 		retries:        make(map[string]*retryState),
 
 		inFlight: make(map[string]bool),
+
+		probeInterval: defaultProbeInterval,
+		parked:        make(map[string]struct{}),
 	}
+}
+
+// SetMetrics makes the pool report when it is paused.
+func (wp *WorkerPool) SetMetrics(m *metrics.Metrics) {
+	wp.metrics = m
+}
+
+func (wp *WorkerPool) setPausedGauge(v float64) {
+	if wp.metrics != nil {
+		wp.metrics.DoveadmPaused.Set(v)
+	}
+}
+
+// SetProbeInterval overrides how often an unreachable Doveadm is checked.
+func (wp *WorkerPool) SetProbeInterval(d time.Duration) {
+	wp.pauseMu.Lock()
+	defer wp.pauseMu.Unlock()
+	wp.probeInterval = d
 }
 
 // SetRetryDelays overrides the delays between retries of a failing user.
@@ -121,6 +162,17 @@ func (wp *WorkerPool) fetcher(ctx context.Context) {
 			wp.logger.Debug("Fetcher stopping")
 			return
 		default:
+		}
+
+		// Hold off while Doveadm is unreachable; the queue keeps every event meanwhile.
+		if resume := wp.pausedCh(); resume != nil {
+			select {
+			case <-wp.stopCh:
+				close(wp.jobsCh)
+				return
+			case <-resume:
+			}
+			continue
 		}
 
 		// Try to dequeue with timeout
@@ -196,8 +248,12 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 
 		// Handle the event
 		if err := wp.handler.Handle(ctx, username); err != nil {
-			delay := wp.scheduleRetry(ctx, username)
-			wp.logger.Error("Handler failed, requeuing", "worker_id", id, "username", username, "delay", delay, "error", err)
+			if wp.pauseFor(ctx, username, err) {
+				wp.logger.Warn("Doveadm unreachable, user waits for it", "worker_id", id, "username", username, "error", err)
+			} else {
+				delay := wp.scheduleRetry(ctx, username)
+				wp.logger.Error("Handler failed, requeuing", "worker_id", id, "username", username, "delay", delay, "error", err)
+			}
 		} else {
 			wp.clearRetry(username)
 		}
@@ -205,6 +261,86 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 
 		// mark inactive
 		atomic.AddInt32(&wp.activeCount, -1)
+	}
+}
+
+// pausedCh returns the channel closed on resume, or nil when not paused.
+func (wp *WorkerPool) pausedCh() chan struct{} {
+	wp.pauseMu.Lock()
+	defer wp.pauseMu.Unlock()
+	return wp.resumeCh
+}
+
+// pauseFor parks the user and pauses the pool if err means Doveadm is unreachable and
+// the handler can probe it. It reports whether it did.
+func (wp *WorkerPool) pauseFor(ctx context.Context, username string, err error) bool {
+	prober, ok := wp.handler.(Prober)
+	if !ok || !doveadm.IsUnreachable(err) {
+		return false
+	}
+	wp.pauseMu.Lock()
+	defer wp.pauseMu.Unlock()
+	wp.parked[username] = struct{}{}
+	if wp.resumeCh == nil {
+		wp.resumeCh = make(chan struct{})
+		wp.logger.Error("Doveadm unreachable, pausing all syncs until it answers", "probe_interval", wp.probeInterval, "error", err)
+		wp.setPausedGauge(1)
+		go wp.probeUntilUp(ctx, prober, wp.probeInterval)
+	}
+	return true
+}
+
+// probeUntilUp checks Doveadm until it answers, then resumes the pool.
+func (wp *WorkerPool) probeUntilUp(ctx context.Context, prober Prober, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	start := time.Now()
+	for {
+		select {
+		case <-wp.stopCh:
+			return
+		case <-ticker.C:
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, interval)
+		err := prober.Probe(probeCtx)
+		cancel()
+		if err != nil {
+			wp.logger.Debug("Doveadm still unreachable", "error", err)
+			continue
+		}
+		wp.resume(ctx, time.Since(start))
+		return
+	}
+}
+
+// resume restarts the pool and syncs every waiting user now: the parked ones, and those
+// in backoff, whose failures were most likely the outage too.
+func (wp *WorkerPool) resume(ctx context.Context, down time.Duration) {
+	wp.retryMu.Lock()
+	users := make(map[string]struct{}, len(wp.retries))
+	for u, r := range wp.retries {
+		if r.timer != nil && r.timer.Stop() {
+			users[u] = struct{}{}
+		}
+	}
+	wp.retries = make(map[string]*retryState)
+	wp.retryMu.Unlock()
+
+	wp.pauseMu.Lock()
+	for u := range wp.parked {
+		users[u] = struct{}{}
+	}
+	wp.parked = make(map[string]struct{})
+	close(wp.resumeCh)
+	wp.resumeCh = nil
+	wp.pauseMu.Unlock()
+	wp.setPausedGauge(0)
+
+	wp.logger.Info("Doveadm answers again, resuming syncs", "paused_for", down, "users", len(users))
+	for u := range users {
+		if err := wp.queue.Enqueue(ctx, u, 1.0); err != nil {
+			wp.logger.Error("Failed to requeue", "username", u, "error", err)
+		}
 	}
 }
 

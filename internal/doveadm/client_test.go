@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -57,7 +59,7 @@ func TestSyncSuccess(t *testing.T) {
 	client := NewClient(server.URL, "testpass")
 	ctx := context.Background()
 
-	resp, err := client.Sync(ctx, "user-a", "imap", "")
+	resp, err := client.Sync(ctx, "user-a", "imap", "", false)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -77,7 +79,7 @@ func TestSyncServerError(t *testing.T) {
 	client := NewClient(server.URL, "testpass")
 	ctx := context.Background()
 
-	_, err := client.Sync(ctx, "user-a", "imap", "")
+	_, err := client.Sync(ctx, "user-a", "imap", "", false)
 	if err == nil {
 		t.Error("expected error for 500 status")
 	}
@@ -94,7 +96,7 @@ func TestSyncUnauthorized(t *testing.T) {
 	client := NewClient(server.URL, "wrongpass")
 	ctx := context.Background()
 
-	_, err := client.Sync(ctx, "user-a", "imap", "")
+	_, err := client.Sync(ctx, "user-a", "imap", "", false)
 	if err == nil {
 		t.Error("expected error for 401 status")
 	}
@@ -158,7 +160,7 @@ func TestSyncPayloadFormat(t *testing.T) {
 	client := NewClient(server.URL, "testpass")
 	ctx := context.Background()
 
-	_, err := client.Sync(ctx, "test-user", "imap", "")
+	_, err := client.Sync(ctx, "test-user", "imap", "", false)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -196,7 +198,7 @@ func TestSyncWithState(t *testing.T) {
 	client := NewClient(server.URL, "testpass")
 	ctx := context.Background()
 
-	resp, err := client.Sync(ctx, "test-user", "imap", "test-state-123")
+	resp, err := client.Sync(ctx, "test-user", "imap", "test-state-123", false)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -236,7 +238,7 @@ func TestSyncWithoutState(t *testing.T) {
 	client := NewClient(server.URL, "testpass")
 	ctx := context.Background()
 
-	resp, err := client.Sync(ctx, "test-user", "imap", "")
+	resp, err := client.Sync(ctx, "test-user", "imap", "", false)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -252,9 +254,63 @@ func TestSyncErrorCarriesExitCode(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := NewClient(server.URL, "testpass").Sync(context.Background(), "user-a", "imap", "old")
+	_, err := NewClient(server.URL, "testpass").Sync(context.Background(), "user-a", "imap", "old", false)
 	var syncErr *SyncError
 	if !errors.As(err, &syncErr) || syncErr.ExitCode != 75 {
 		t.Fatalf("expected a SyncError with exit code 75, got %v", err)
+	}
+}
+
+// TestUnreachableErrors verifies that a refused connection and a 503 are reported as
+// Doveadm being unreachable, while a dsync failure and a 500 are not.
+func TestUnreachableErrors(t *testing.T) {
+	ctx := context.Background()
+
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closed.Close()
+	if _, err := NewClient(closed.URL, "pw").Sync(ctx, "u", "imap", "", false); !IsUnreachable(err) {
+		t.Errorf("refused connection: got %v", err)
+	}
+	if err := NewClient(closed.URL, "pw").Probe(ctx); !IsUnreachable(err) {
+		t.Errorf("probe of refused connection: got %v", err)
+	}
+
+	for code, want := range map[int]bool{503: true, 502: true, 500: false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+		}))
+		_, err := NewClient(srv.URL, "pw").Sync(ctx, "u", "imap", "", false)
+		srv.Close()
+		if err == nil || IsUnreachable(err) != want {
+			t.Errorf("status %d: unreachable=%v, want %v (%v)", code, IsUnreachable(err), want, err)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[["error",{"type":"exitCode","exitCode":2},"dovewarden-sync"]]`))
+	}))
+	defer srv.Close()
+	if _, err := NewClient(srv.URL, "pw").Sync(ctx, "u", "imap", "", false); err == nil || IsUnreachable(err) {
+		t.Errorf("dsync failure: got %v", err)
+	}
+	if err := NewClient(srv.URL, "pw").Probe(ctx); err != nil {
+		t.Errorf("probe of a live server: %v", err)
+	}
+}
+
+// TestFullSyncParam verifies fullSync is sent only when asked for.
+func TestFullSyncParam(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		_, _ = w.Write([]byte(`[["doveadmResponse",[],"dovewarden-sync"]]`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "pw")
+	_, _ = c.Sync(context.Background(), "u", "imap", "", false)
+	_, _ = c.Sync(context.Background(), "u", "imap", "", true)
+	if strings.Contains(bodies[0], "fullSync") || !strings.Contains(bodies[1], `"fullSync":true`) {
+		t.Errorf("unexpected bodies: %v", bodies)
 	}
 }

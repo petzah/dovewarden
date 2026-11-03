@@ -69,6 +69,8 @@ spec:
               value: "{{ .Values.config.backgroundReplication.interval }}"
             - name: DOVEWARDEN_BACKGROUND_REPLICATION_THRESHOLD
               value: "{{ .Values.config.backgroundReplication.threshold }}"
+            - name: DOVEWARDEN_FULL_SYNC_INTERVAL
+              value: "{{ .Values.config.fullSyncInterval }}"
             - name: DOVEWARDEN_DOVEADM_URL
               value: "{{ .Values.config.doveadm.url }}"
             {{- if .Values.config.doveadm.password }}

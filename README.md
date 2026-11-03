@@ -31,6 +31,15 @@ Configuration is possible using either environment variables or CLI flags.
 - `DOVEWARDEN_BACKGROUND_REPLICATION_ENABLED` (`--background-replication-enabled`): Enable background replication (default: `true`)
 - `DOVEWARDEN_BACKGROUND_REPLICATION_INTERVAL` (`--background-replication-interval`): Background replication interval (default: `1h`)
 - `DOVEWARDEN_BACKGROUND_REPLICATION_THRESHOLD` (`--background-replication-threshold`): Skip users replicated within this time (default: `24h`)
+- `DOVEWARDEN_FULL_SYNC_INTERVAL` (`--full-sync-interval`): `0` makes every sync a full one. A duration sends a full sync only after a failure, on each user's first sync after start, and at that interval (default: `0`)
+
+### Sync modes
+
+dovewarden keeps no incremental dsync state, since a wrong state makes dsync skip changes while still reporting success. Without state, dsync still skips a mailbox whose message count, uidnext and highestmodseq are equal on both sides, so mail can differ behind equal counters. It takes no more than one new message, or one flag change, on each side between two syncs. A full sync (`doveadm sync -f`) compares every mailbox, so by default every sync is full. In tests with 200 messages per mailbox this cost under 10% more time per sync. On large mailboxes you can set `DOVEWARDEN_FULL_SYNC_INTERVAL` to a duration instead; then a full sync is sent only after a failure, on each user's first sync after start, and at that interval.
+
+### When Doveadm is unreachable
+
+If a sync fails because Doveadm cannot be reached (connection refused, DNS failure, or HTTP 502/503/504), dovewarden pauses all syncs and checks Doveadm every 2 seconds instead of retrying each user. Events keep being queued. When Doveadm answers, every waiting user is synced at once. Other failures are retried per user, with a delay that doubles from 1 second up to 30 seconds. A longer delay means fewer syncs of a busy mailbox, and on maildir every sync that races IMAP or LMTP delivery can leave a duplicate.
 
 ### Background Replication
 
@@ -42,6 +51,13 @@ The background replication service:
 - Tracks the last replication time for each user in Redis
 - Skips users who were replicated within the threshold period (default: 24 hours)
 - Can be disabled by setting `DOVEWARDEN_BACKGROUND_REPLICATION_ENABLED=false`
+
+Keep it enabled. Dovecot does not resend events that dovewarden missed while it was down or restarting, and the in-memory queue loses its contents and the last replication times on restart. The background pass is what syncs those users again.
+
+### Monitoring
+
+- `dovewarden_syncs_total{result,full}`: dsync runs by result (`ok`, `failed`, `unreachable`). Alert when `failed` keeps rising: each dsync failure can leave a duplicate message that no later sync removes.
+- `dovewarden_doveadm_paused`: `1` while Doveadm does not answer and syncs are paused. Alert if it stays at `1`.
 
 ## API Endpoints
 

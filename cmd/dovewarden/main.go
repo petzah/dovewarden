@@ -73,6 +73,7 @@ func main() {
 		"namespace", cfg.Namespace,
 		"num_workers", cfg.NumWorkers,
 		"doveadm_url", cfg.DoveadmURL,
+		"full_sync_interval", cfg.FullSyncInterval,
 	)
 
 	// Initialize metrics with default prometheus registry
@@ -111,6 +112,9 @@ func main() {
 	}
 	slog.Info("Setting up Doveadm sync handler")
 	handler := queue.NewDoveadmEventHandler(cfg.DoveadmURL, cfg.DoveadmPassword, cfg.DoveadmDest, logger, q)
+	handler.SetFullSyncInterval(cfg.FullSyncInterval)
+	handler.SetMetrics(m)
+	workerPool.SetMetrics(m)
 	workerPool.SetHandler(handler)
 
 	workerPool.Start(context.Background())

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,64 @@ type SyncError struct {
 
 func (e *SyncError) Error() string {
 	return fmt.Sprintf("doveadm sync error (tag %s): %s (exitCode %d)", e.Tag, e.Type, e.ExitCode)
+}
+
+// UnreachableError means Doveadm itself could not be reached or is not serving: the
+// connection failed, or a proxy in front of it answered 502, 503 or 504. It says nothing
+// about the user, so retrying the user alone does not help.
+type UnreachableError struct {
+	Err error
+}
+
+func (e *UnreachableError) Error() string {
+	return fmt.Sprintf("doveadm unreachable: %v", e.Err)
+}
+
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// IsUnreachable reports whether err means Doveadm could not be reached.
+func IsUnreachable(err error) bool {
+	var u *UnreachableError
+	return errors.As(err, &u)
+}
+
+func unreachableStatus(code int) bool {
+	return code == http.StatusBadGateway || code == http.StatusServiceUnavailable || code == http.StatusGatewayTimeout
+}
+
+// do sends req and reads the whole response. A failed connection is an UnreachableError,
+// unless ctx was cancelled, which is the caller giving up rather than Doveadm failing.
+func (c *Client) do(ctx context.Context, req *http.Request) (int, []byte, error) {
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil, fmt.Errorf("failed to send request: %w", err)
+		}
+		return 0, nil, &UnreachableError{Err: err}
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if unreachableStatus(resp.StatusCode) {
+		return resp.StatusCode, body, &UnreachableError{Err: fmt.Errorf("status %d", resp.StatusCode)}
+	}
+	return resp.StatusCode, body, nil
+}
+
+// Probe checks that Doveadm answers, without touching any mailbox: it asks for the list of
+// commands. Any answer other than an UnreachableError counts as up.
+func (c *Client) Probe(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/doveadm/v1", nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.SetBasicAuth("doveadm", c.password)
+	_, _, err = c.do(ctx, req)
+	return err
 }
 
 // SyncResponse represents the response from a sync operation
@@ -102,14 +161,20 @@ func (r *responseEntry) UnmarshalJSON(data []byte) error {
 // Sync performs a dsync operation for the given user to the specified destination.
 // If state is provided (non-empty), it will be used for incremental sync.
 // Returns the new state string for the next sync operation.
-func (c *Client) Sync(ctx context.Context, username string, destination string, state string) (*SyncResponse, error) {
+//
+// An empty state is not a full sync: dsync still skips a mailbox whose message count,
+// uidnext and highestmodseq are equal on both sides, even when the mail differs. Only
+// full (doveadm sync -f) compares every mailbox.
+func (c *Client) Sync(ctx context.Context, username string, destination string, state string, full bool) (*SyncResponse, error) {
 	// Build the request payload according to Doveadm API format:
 	// [["sync",{"destination":["$destination"],"user":"$username","state":"$state"},"tag1"]]
 	params := map[string]interface{}{
 		"destination": []string{destination},
-		// adding an empty string/invalid state will cause a full sync, but still return a new state
-		"state": state,
-		"user":  username,
+		"state":       state,
+		"user":        username,
+	}
+	if full {
+		params["fullSync"] = true
 	}
 
 	payload := []interface{}{
@@ -133,23 +198,14 @@ func (c *Client) Sync(ctx context.Context, username string, destination string, 
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth("doveadm", c.password)
 
-	resp, err := c.client.Do(req)
+	status, respBody, err := c.do(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	// Read response body for debugging
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
 
 	// Check for HTTP errors
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("doveadm sync failed with status %d: %s", resp.StatusCode, string(respBody))
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("doveadm sync failed with status %d: %s", status, string(respBody))
 	}
 
 	// Doveadm API returns error with HTTP 200 but indicates failure in the response body
@@ -220,23 +276,14 @@ func (c *Client) ListUsers(ctx context.Context) ([]User, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth("doveadm", c.password)
 
-	resp, err := c.client.Do(req)
+	status, respBody, err := c.do(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	// Read response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
 
 	// Check for HTTP errors
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("doveadm user list failed with status %d: %s", resp.StatusCode, string(respBody))
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("doveadm user list failed with status %d: %s", status, string(respBody))
 	}
 
 	// Parse response

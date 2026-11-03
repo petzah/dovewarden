@@ -22,6 +22,7 @@ type Config struct {
 	BackgroundReplicationEnabled   bool
 	BackgroundReplicationInterval  time.Duration
 	BackgroundReplicationThreshold time.Duration
+	FullSyncInterval               time.Duration
 }
 
 // Load reads configuration from environment and command-line flags.
@@ -40,6 +41,7 @@ func Load() *Config {
 		BackgroundReplicationEnabled:   true,
 		BackgroundReplicationInterval:  time.Hour,
 		BackgroundReplicationThreshold: 24 * time.Hour,
+		FullSyncInterval:               0,
 	}
 
 	flag.StringVar(&cfg.HTTPAddr, "http-addr", envOrDefault("DOVEWARDEN_HTTP_ADDR", cfg.HTTPAddr), "HTTP server listen address for events")
@@ -75,6 +77,12 @@ func Load() *Config {
 		cfg.BackgroundReplicationThreshold = threshold
 	}
 	flag.DurationVar(&cfg.BackgroundReplicationThreshold, "background-replication-threshold", cfg.BackgroundReplicationThreshold, "Background replication threshold - users replicated within this time are skipped")
+
+	fullSyncIntervalStr := envOrDefault("DOVEWARDEN_FULL_SYNC_INTERVAL", "0")
+	if d, err := time.ParseDuration(fullSyncIntervalStr); err == nil && d >= 0 {
+		cfg.FullSyncInterval = d
+	}
+	flag.DurationVar(&cfg.FullSyncInterval, "full-sync-interval", cfg.FullSyncInterval, "How often each user gets a full sync (doveadm sync -f) when nothing failed; 0 makes every sync full")
 
 	flag.Parse()
 

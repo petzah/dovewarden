@@ -120,6 +120,11 @@ config:
     # Skip users that were replicated within this threshold
     threshold: "24h"
 
+  # How often each user gets a full sync (doveadm sync -f) when nothing failed. "0" makes
+  # every sync full; a duration sends a full sync only after a failure, on each user's
+  # first sync after start, and at that interval
+  fullSyncInterval: "0"
+
   # Doveadm configuration
   doveadm:
     url: "http://doveadm:8080"

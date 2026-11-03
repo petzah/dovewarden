@@ -1,3 +1,9 @@
+# dovewarden 0.1.1-homelab.5
+
+- fix: every sync is now a real full sync (`fullSync`, as `doveadm sync -f`). A sync without state still skipped mailboxes whose counters matched, so one delivery or flag change on each side between two syncs was never copied, and homelab.4's "every sync is full" was not true. `DOVEWARDEN_FULL_SYNC_INTERVAL` set to a duration limits full syncs to after a failure, each user's first sync after start, and that interval
+- fix: when Doveadm is unreachable, pause all syncs and probe it every 2 s instead of retrying each user; on recovery every waiting user is synced at once
+- feat: `dovewarden_syncs_total{result,full}` and `dovewarden_doveadm_paused` metrics
+
 # dovewarden 0.1.1-homelab.4
 
 - fix: every sync is now a full sync and no state is kept. Incremental state could go wrong silently: dsync exited 0 while the sides stayed different. This replaces the state handling of homelab.1 to homelab.3 and also avoids the 32 KiB state limit (upstream #14, #15, #16)
