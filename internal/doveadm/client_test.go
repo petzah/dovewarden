@@ -314,3 +314,29 @@ func TestFullSyncParam(t *testing.T) {
 		t.Errorf("unexpected bodies: %v", bodies)
 	}
 }
+
+// TestUserAgent verifies requests name dovewarden instead of Go's default agent.
+func TestUserAgent(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.UserAgent())
+		_, _ = w.Write([]byte(`[["doveadmResponse",[],"t"]]`))
+	}))
+	defer srv.Close()
+	old := UserAgent
+	UserAgent = "dovewarden/1.2.3"
+	defer func() { UserAgent = old }()
+
+	c := NewClient(srv.URL, "pw")
+	_, _ = c.Sync(context.Background(), "u", "imap", "", false)
+	_ = c.Probe(context.Background())
+	_, _ = c.ListUsers(context.Background())
+	for i, ua := range got {
+		if ua != "dovewarden/1.2.3" {
+			t.Errorf("request %d: User-Agent %q", i, ua)
+		}
+	}
+	if len(got) != 3 {
+		t.Errorf("expected 3 requests, got %d", len(got))
+	}
+}

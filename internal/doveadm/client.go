@@ -10,6 +10,9 @@ import (
 	"net/http"
 )
 
+// UserAgent is sent with every request to Doveadm. main sets it to dovewarden/<version>.
+var UserAgent = "dovewarden"
+
 // Client handles communication with the Doveadm API
 type Client struct {
 	baseURL  string
@@ -70,6 +73,7 @@ func unreachableStatus(code int) bool {
 // do sends req and reads the whole response. A failed connection is an UnreachableError,
 // unless ctx was cancelled, which is the caller giving up rather than Doveadm failing.
 func (c *Client) do(ctx context.Context, req *http.Request) (int, []byte, error) {
+	req.Header.Set("User-Agent", UserAgent)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {

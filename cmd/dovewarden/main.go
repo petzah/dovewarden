@@ -63,6 +63,8 @@ func main() {
 
 	slog.SetDefault(logger)
 
+	doveadm.UserAgent = "dovewarden/" + version
+
 	// Log version information
 	slog.Info("dovewarden starting", "version", version, "log_level", lvl.String())
 
