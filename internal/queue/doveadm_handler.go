@@ -58,7 +58,7 @@ func (h *DoveadmEventHandler) SetMetrics(m *metrics.Metrics) {
 	h.metrics = m
 }
 
-func (h *DoveadmEventHandler) countSync(full bool, err error) {
+func (h *DoveadmEventHandler) countSync(full bool, err error, took time.Duration) {
 	if h.metrics == nil {
 		return
 	}
@@ -69,6 +69,7 @@ func (h *DoveadmEventHandler) countSync(full bool, err error) {
 		result = "failed"
 	}
 	h.metrics.Syncs.WithLabelValues(result, strconv.FormatBool(full)).Inc()
+	h.metrics.SyncDuration.WithLabelValues(result).Observe(took.Seconds())
 }
 
 // Probe reports whether Doveadm answers at all.
@@ -95,6 +96,11 @@ func (h *DoveadmEventHandler) needsFull(username string) bool {
 func (h *DoveadmEventHandler) recordResult(username string, full bool, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.UsersFailing.Set(float64(len(h.failed)))
+		}
+	}()
 	if err != nil {
 		h.failed[username] = true
 		return
@@ -119,9 +125,10 @@ func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error
 	full := h.needsFull(username)
 	h.logger.Info("Syncing user via dsync", "username", username, "destination", h.destination, "full", full)
 
+	start := time.Now()
 	_, err := h.client.Sync(ctx, username, h.destination, "", full)
 	h.recordResult(username, full, err)
-	h.countSync(full, err)
+	h.countSync(full, err, time.Since(start))
 	if err != nil {
 		h.logger.Error("dsync failed", "username", username, "full", full, "error", err)
 		return err

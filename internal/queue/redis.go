@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,6 +25,8 @@ type InMemoryQueue struct {
 	// operation counters
 	enqueueCount uint64
 	dequeueCount uint64
+
+	errors prometheus.Counter // optional
 }
 
 // NewInMemoryQueue creates a new in-memory Redis queue.
@@ -60,6 +63,25 @@ func NewInMemoryQueue(namespace string, addr string, logger *slog.Logger) (*InMe
 	}, nil
 }
 
+// SetErrorCounter makes the queue count errors from its Redis store.
+func (q *InMemoryQueue) SetErrorCounter(c prometheus.Counter) {
+	q.errors = c
+}
+
+// countErr counts err if it is a store error; redis.Nil only means "no such key".
+func (q *InMemoryQueue) countErr(err error) {
+	if err != nil && err != redis.Nil && q.errors != nil {
+		q.errors.Inc()
+	}
+}
+
+// Depth returns the number of users waiting in the queue.
+func (q *InMemoryQueue) Depth(ctx context.Context) (int64, error) {
+	n, err := q.client.ZCard(ctx, fmt.Sprintf("%s:%s", q.ns, SYNC_TASKS)).Result()
+	q.countErr(err)
+	return n, err
+}
+
 // Enqueue adds or updates a user to the priority queue.
 // Uses a sorted set with the timestamp divided by the priority factor as the score.
 // Lower score = higher priority.
@@ -82,6 +104,7 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, username string, priorityFa
 		Score:  score,
 		Member: username,
 	}).Err(); err != nil {
+		q.countErr(err)
 		return fmt.Errorf("failed to enqueue event: %w", err)
 	}
 	atomic.AddUint64(&q.enqueueCount, 1)
@@ -96,6 +119,7 @@ func (q *InMemoryQueue) Dequeue(ctx context.Context) (string, error) {
 	// https://github.com/alicebob/miniredis/issues/428
 	result, err := q.client.ZPopMin(ctx, key).Result()
 	if err != nil {
+		q.countErr(err)
 		return "", fmt.Errorf("failed to dequeue: %w", err)
 	}
 	if len(result) == 0 {
@@ -178,6 +202,7 @@ func (q *InMemoryQueue) GetLastReplicationTime(ctx context.Context, username str
 		return time.Time{}, nil
 	}
 	if err != nil {
+		q.countErr(err)
 		q.logger.Debug("failed to get last replication time", "username", username, "key", key, "error", err)
 		return time.Time{}, fmt.Errorf("failed to get last replication time: %w", err)
 	}
@@ -202,6 +227,7 @@ func (q *InMemoryQueue) SetLastReplicationTime(ctx context.Context, username str
 	// Set TTL to 30 days - timestamps older than this are considered stale
 	ttl := 30 * 24 * time.Hour
 	if err := q.client.Set(ctx, key, timestampStr, ttl).Err(); err != nil {
+		q.countErr(err)
 		q.logger.Debug("failed to set last replication time", "username", username, "key", key, "time", t, "error", err)
 		return fmt.Errorf("failed to set last replication time: %w", err)
 	}

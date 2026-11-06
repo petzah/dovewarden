@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dovewarden/dovewarden/internal/doveadm"
+	"github.com/dovewarden/dovewarden/internal/metrics"
 )
 
 // BackgroundReplicationService manages periodic background replication
@@ -17,6 +18,14 @@ type BackgroundReplicationService struct {
 	threshold time.Duration
 	stopCh    chan struct{}
 	doneCh    chan struct{}
+
+	started time.Time
+	metrics *metrics.Metrics // optional
+}
+
+// SetMetrics makes the service report its passes and how stale the users are.
+func (s *BackgroundReplicationService) SetMetrics(m *metrics.Metrics) {
+	s.metrics = m
 }
 
 // NewBackgroundReplicationService creates a new background replication service
@@ -35,6 +44,7 @@ func NewBackgroundReplicationService(
 		threshold: threshold,
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
+		started:   time.Now(),
 	}
 }
 
@@ -96,8 +106,18 @@ func (s *BackgroundReplicationService) runReplication(ctx context.Context) error
 	// List all users from doveadm
 	users, err := s.client.ListUsers(ctx)
 	if err != nil {
+		// Without the list nothing is checked, so the staleness gauges keep their last
+		// values and alerts must watch the time of the last success.
+		if s.metrics != nil {
+			s.metrics.BackgroundRuns.WithLabelValues("failed").Inc()
+		}
 		return err
 	}
+
+	// A user never synced since this process started counts from the start: the times
+	// are kept in memory only.
+	oldest := startTime
+	staleCount := 0
 
 	s.logger.Info("Retrieved user list from doveadm", "count", len(users))
 
@@ -115,6 +135,17 @@ func (s *BackgroundReplicationService) runReplication(ctx context.Context) error
 			)
 			errorCount++
 			// Continue to enqueue in case of error
+		}
+
+		synced := lastReplication
+		if synced.IsZero() {
+			synced = s.started
+		}
+		if synced.Before(oldest) {
+			oldest = synced
+		}
+		if time.Since(synced) >= s.threshold {
+			staleCount++
 		}
 
 		// Skip if user was replicated within the threshold
@@ -143,6 +174,14 @@ func (s *BackgroundReplicationService) runReplication(ctx context.Context) error
 			"last_replication", lastReplication,
 		)
 		enqueuedCount++
+	}
+
+	if s.metrics != nil {
+		s.metrics.BackgroundRuns.WithLabelValues("ok").Inc()
+		s.metrics.BackgroundLastSuccess.Set(float64(time.Now().UnixNano()) / 1e9)
+		s.metrics.UsersTotal.Set(float64(len(users)))
+		s.metrics.UsersStale.Set(float64(staleCount))
+		s.metrics.OldestUserSyncTimestamp.Set(float64(oldest.UnixNano()) / 1e9)
 	}
 
 	duration := time.Since(startTime)

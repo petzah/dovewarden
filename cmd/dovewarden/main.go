@@ -87,11 +87,22 @@ func main() {
 
 	if cfg.RedisMode == "inmemory" {
 		slog.Info("Initializing in-memory Redis queue")
-		q, err = queue.NewInMemoryQueue(cfg.Namespace, cfg.RedisAddr, logger)
+		mq, err := queue.NewInMemoryQueue(cfg.Namespace, cfg.RedisAddr, logger)
 		if err != nil {
 			slog.Error("failed to create in-memory queue", "error", err)
 			os.Exit(1)
 		}
+		mq.SetErrorCounter(m.RedisErrors)
+		metrics.RegisterQueueDepth(prometheus.DefaultRegisterer, func() float64 {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			n, err := mq.Depth(ctx)
+			if err != nil {
+				return -1
+			}
+			return float64(n)
+		})
+		q = mq
 	} else {
 		slog.Error("Redis mode not yet implemented", "mode", cfg.RedisMode)
 		os.Exit(1)
@@ -137,6 +148,7 @@ func main() {
 			cfg.BackgroundReplicationInterval,
 			cfg.BackgroundReplicationThreshold,
 		)
+		backgroundReplicationService.SetMetrics(m)
 		backgroundReplicationService.Start(context.Background())
 	} else {
 		slog.Info("Background replication disabled")

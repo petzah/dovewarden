@@ -111,6 +111,13 @@ func (wp *WorkerPool) SetMetrics(m *metrics.Metrics) {
 	wp.metrics = m
 }
 
+// setRetryingGauge must be called with retryMu held.
+func (wp *WorkerPool) setRetryingGauge() {
+	if wp.metrics != nil {
+		wp.metrics.UsersRetrying.Set(float64(len(wp.retries)))
+	}
+}
+
 func (wp *WorkerPool) setPausedGauge(v float64) {
 	if wp.metrics != nil {
 		wp.metrics.DoveadmPaused.Set(v)
@@ -324,6 +331,7 @@ func (wp *WorkerPool) resume(ctx context.Context, down time.Duration) {
 		}
 	}
 	wp.retries = make(map[string]*retryState)
+	wp.setRetryingGauge()
 	wp.retryMu.Unlock()
 
 	wp.pauseMu.Lock()
@@ -389,6 +397,7 @@ func (wp *WorkerPool) scheduleRetry(ctx context.Context, username string) time.D
 	if !ok {
 		r = &retryState{}
 		wp.retries[username] = r
+		wp.setRetryingGauge()
 	}
 	r.failures++
 
@@ -420,6 +429,7 @@ func (wp *WorkerPool) clearRetry(username string) {
 	wp.retryMu.Lock()
 	defer wp.retryMu.Unlock()
 	delete(wp.retries, username)
+	wp.setRetryingGauge()
 }
 
 // takeJob reads a single job from jobsCh, blocking until available or channel closed.
