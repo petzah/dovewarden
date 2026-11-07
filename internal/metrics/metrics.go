@@ -84,7 +84,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			prometheus.HistogramOpts{
 				Name:    "dovewarden_sync_duration_seconds",
 				Help:    "Duration of dsync runs, by result (ok, failed, unreachable)",
-				Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+				// A catch-up after an outage took over 8 minutes on dev, so the buckets go to 30 minutes.
+				Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200, 1800},
 			},
 			[]string{"result"},
 		),
