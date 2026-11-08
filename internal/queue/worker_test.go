@@ -385,3 +385,41 @@ func TestOutagePausesAndResumes(t *testing.T) {
 		}
 	}
 }
+
+// TestRemovedUserIsNotRetried verifies a user that no longer exists is dropped instead of
+// being retried for good: no retry would ever succeed.
+func TestRemovedUserIsNotRetried(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewInMemoryQueue("test", "", logger)
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var attempts int32
+	wp := NewWorkerPool(q, 2, logger)
+	wp.SetRetryDelays(50*time.Millisecond, 100*time.Millisecond)
+	wp.SetHandler(&TestHandler{onHandle: func(string) error {
+		atomic.AddInt32(&attempts, 1)
+		return &doveadm.SyncError{Tag: "t", Type: "exitCode", ExitCode: doveadm.ExitNoUser}
+	}})
+	wp.Start(ctx)
+	if err := q.Enqueue(ctx, "gone", 1.0); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	time.Sleep(time.Second)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := wp.Stop(stopCtx); err != nil {
+		t.Fatalf("failed to stop worker pool: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("expected one attempt, got %d", got)
+	}
+	if wp.retryPending("gone") {
+		t.Error("a removed user should have no retry pending")
+	}
+}

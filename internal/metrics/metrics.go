@@ -12,7 +12,7 @@ type Metrics struct {
 	EnqueueErrors  prometheus.Counter
 	RedisErrors    prometheus.Counter
 
-	// Syncs counts dsync runs by result (ok, failed, unreachable) and by whether they
+	// Syncs counts dsync runs by result (ok, failed, unreachable, nouser) and by whether they
 	// were full.
 	Syncs *prometheus.CounterVec
 	// DoveadmPaused is 1 while all syncs are paused because Doveadm does not answer.
@@ -70,7 +70,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		Syncs: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "dovewarden_syncs_total",
-				Help: "Total number of dsync runs, by result (ok, failed, unreachable) and full (true, false)",
+				Help: "Total number of dsync runs, by result (ok, failed, unreachable, nouser) and full (true, false)",
 			},
 			[]string{"result", "full"},
 		),
@@ -82,8 +82,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		),
 		SyncDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
-				Name:    "dovewarden_sync_duration_seconds",
-				Help:    "Duration of dsync runs, by result (ok, failed, unreachable)",
+				Name: "dovewarden_sync_duration_seconds",
+				Help: "Duration of dsync runs, by result (ok, failed, unreachable, nouser)",
 				// A catch-up after an outage took over 8 minutes on dev, so the buckets go to 30 minutes.
 				Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200, 1800},
 			},

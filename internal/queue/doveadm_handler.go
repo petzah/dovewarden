@@ -65,6 +65,8 @@ func (h *DoveadmEventHandler) countSync(full bool, err error, took time.Duration
 	result := "ok"
 	if doveadm.IsUnreachable(err) {
 		result = "unreachable"
+	} else if doveadm.IsNoUser(err) {
+		result = "nouser"
 	} else if err != nil {
 		result = "failed"
 	}
@@ -101,6 +103,12 @@ func (h *DoveadmEventHandler) recordResult(username string, full bool, err error
 			h.metrics.UsersFailing.Set(float64(len(h.failed)))
 		}
 	}()
+	if doveadm.IsNoUser(err) {
+		// Removed users are forgotten, so they are not counted as failing for good.
+		delete(h.failed, username)
+		delete(h.lastFull, username)
+		return
+	}
 	if err != nil {
 		h.failed[username] = true
 		return
@@ -129,6 +137,10 @@ func (h *DoveadmEventHandler) Handle(ctx context.Context, username string) error
 	_, err := h.client.Sync(ctx, username, h.destination, "", full)
 	h.recordResult(username, full, err)
 	h.countSync(full, err, time.Since(start))
+	if doveadm.IsNoUser(err) {
+		h.logger.Warn("dsync failed: user does not exist", "username", username, "full", full, "error", err)
+		return err
+	}
 	if err != nil {
 		h.logger.Error("dsync failed", "username", username, "full", full, "error", err)
 		return err

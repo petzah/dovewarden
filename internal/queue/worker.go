@@ -255,7 +255,12 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 
 		// Handle the event
 		if err := wp.handler.Handle(ctx, username); err != nil {
-			if wp.pauseFor(ctx, username, err) {
+			if doveadm.IsNoUser(err) {
+				// A removed user: retrying cannot help, and a new event queues the user
+				// again once it exists.
+				wp.clearRetry(username)
+				wp.logger.Warn("User does not exist, not retrying", "worker_id", id, "username", username)
+			} else if wp.pauseFor(ctx, username, err) {
 				wp.logger.Warn("Doveadm unreachable, user waits for it", "worker_id", id, "username", username, "error", err)
 			} else {
 				delay := wp.scheduleRetry(ctx, username)

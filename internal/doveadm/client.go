@@ -60,6 +60,17 @@ func (e *UnreachableError) Error() string {
 
 func (e *UnreachableError) Unwrap() error { return e.Err }
 
+// ExitNoUser is the exit code Doveadm reports when the user does not exist on one of the
+// two sides (sysexits EX_NOUSER).
+const ExitNoUser = 67
+
+// IsNoUser reports whether err is a sync that failed because the user does not exist, on
+// either side. Retrying cannot help until the user is added again.
+func IsNoUser(err error) bool {
+	var s *SyncError
+	return errors.As(err, &s) && s.ExitCode == ExitNoUser
+}
+
 // IsUnreachable reports whether err means Doveadm could not be reached.
 func IsUnreachable(err error) bool {
 	var u *UnreachableError

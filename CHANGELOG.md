@@ -1,3 +1,7 @@
+# dovewarden 0.1.1-homelab.8
+
+- fix: a user Doveadm reports as unknown (exit code 67) is no longer retried. A removed user was retried every 30 s until dovewarden restarted. Such syncs count as `result="nouser"`, and the user is not counted as failing; its next event queues it again
+
 # dovewarden 0.1.1-homelab.5
 
 - fix: every sync is now a real full sync (`fullSync`, as `doveadm sync -f`). A sync without state still skipped mailboxes whose counters matched, so one delivery or flag change on each side between two syncs was never copied, and homelab.4's "every sync is full" was not true. `DOVEWARDEN_FULL_SYNC_INTERVAL` set to a duration limits full syncs to after a failure, each user's first sync after start, and that interval

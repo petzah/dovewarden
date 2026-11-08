@@ -56,7 +56,7 @@ Keep it enabled. Dovecot does not resend events that dovewarden missed while it 
 
 ### Monitoring
 
-- `dovewarden_syncs_total{result,full}`: dsync runs by result (`ok`, `failed`, `unreachable`). Alert when `failed` keeps rising: each dsync failure can leave a duplicate message that no later sync removes.
+- `dovewarden_syncs_total{result,full}`: dsync runs by result (`ok`, `failed`, `unreachable`, `nouser`). `nouser` means the user does not exist on one side, usually just removed; such a user is not retried. Alert when `failed` keeps rising: each dsync failure can leave a duplicate message that no later sync removes.
 - `dovewarden_doveadm_paused`: `1` while Doveadm does not answer and syncs are paused. Alert if it stays at `1`.
 
 ## API Endpoints

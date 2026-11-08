@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dovewarden/dovewarden/internal/doveadm"
 	"github.com/dovewarden/dovewarden/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -142,5 +143,27 @@ func TestFailedSyncReturnsError(t *testing.T) {
 	h := NewDoveadmEventHandler(server.URL, "pw", "tcp:b:12345", logger, q)
 	if err := h.Handle(context.Background(), "u"); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// TestRemovedUserIsNotFailing verifies a user Doveadm reports as unknown (exit code 67)
+// is counted as nouser and is not left on record as failing.
+func TestRemovedUserIsNotFailing(t *testing.T) {
+	h, _, _ := newTestHandler(t, func() string {
+		return `[["error",{"type":"exitCode","exitCode":67},"dovewarden-sync"]]`
+	})
+	m := metrics.New(prometheus.NewRegistry())
+	h.SetMetrics(m)
+	err := h.Handle(context.Background(), "gone")
+	if !doveadm.IsNoUser(err) {
+		t.Fatalf("expected a no-user error, got %v", err)
+	}
+	if len(h.failed) != 0 {
+		t.Errorf("a removed user should not be on record as failing")
+	}
+	var d dto.Metric
+	_ = m.Syncs.WithLabelValues("nouser", "true").Write(&d)
+	if d.GetCounter().GetValue() != 1 {
+		t.Errorf("expected one nouser sync, got %v", d.GetCounter().GetValue())
 	}
 }
